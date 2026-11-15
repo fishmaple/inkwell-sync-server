@@ -1,0 +1,1591 @@
+import { createHash, timingSafeEqual } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { Hono, type Context } from "hono";
+import { bytesToBase64Url, randomBytes } from "../shared/src/codec";
+import { flushReasonForSync } from "../shared/src/history";
+import {
+  DEVICE_TTL_MS,
+  MAX_BODY_BYTES,
+  MAX_FILE_BYTES,
+  PAIRING_TTL_MS,
+  PROTOCOL_VERSION,
+  type Encoding,
+  type ObjectPayload,
+  type PayloadCipher,
+  type RemoteFile,
+} from "../shared/src/protocol";
+import type { AppConfig } from "./config";
+import { TipMovedError, type ObjectRow, type SyncDb } from "./db";
+import { HttpError } from "./http-error";
+import { accessPage, accountPage, adminPage, homePage, installPage, installPs1, installSh, loginPage, messagePage, obsidianReturnPage, pairPage, withFrontendNav, type FrontendNavItem } from "../web/pages";
+import { createBlobStore } from "./storage";
+import { acceptServerUpload, directRequestValid, discardUpload, finishUpload, listTransferUrls, listVersionDownloads, serverDownload, serverVersionDownload, versionRequestValid } from "./urls";
+import { assertVersionId, forgetVersionBlobs, historyResponse, parseCheckpointUpload, parseHistoryOptions, parseRetentionBody, recordHistory, retentionFor, storeUploadedCheckpoint, toVersionInfo } from "./versions";
+import { completeOidcLogin, createOidcRequest } from "./oidc";
+import { clearCookieHeader, openSession, readCookie, sealSession, sessionCookieName, setCookieHeader } from "./session";
+import { hashPassword, randomPassword, validLoginId, verifyPassword } from "./passwords";
+
+const FILE_ID = /^[0-9a-f]{64}$/;
+const DEVICE_CODE = /^[A-Za-z0-9_-]{32,128}$/;
+const LOGIN_STATE = /^[A-Za-z0-9_-]{22,128}$/;
+const USERNAME = /^[^\u0000-\u001f\u007f]{2,64}$/;
+const VAULT_NAME = /^[^\u0000-\u001f\u007f\\/]{1,120}$/;
+const PAIRING_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+const PAIRING_CODE = /^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{8}$/;
+
+export { HttpError } from "./http-error";
+
+export interface AppDeps {
+  config: AppConfig;
+  db: SyncDb;
+}
+
+/** Closed-source add-ons attach here. Routes are registered after the built-in pages, so they cannot replace them. */
+export interface AppMount {
+  nav?: readonly FrontendNavItem[];
+  routes?: (app: Hono, deps: AppDeps) => void;
+}
+
+export function createApp(deps: AppDeps, mount?: AppMount): Hono {
+  const { config, db } = deps;
+  const blobs = createBlobStore(config, db);
+  const app = new Hono();
+  let deviceStarts: number[] = [];
+  const pairingRedeems: number[] = [];
+
+  app.use("*", async (c, next) => {
+    await withFrontendNav(mount?.nav ?? [], async () => {
+      await next();
+    });
+    c.header("X-Content-Type-Options", "nosniff");
+    c.header("Referrer-Policy", "no-referrer");
+    c.header("X-Frame-Options", "DENY");
+  });
+
+  app.get("/favicon.png", (c) => iconResponse(c));
+  app.get("/favicon.ico", (c) => iconResponse(c));
+
+  app.get("/", (c) => {
+    if (config.mode === "single") return c.redirect("/account");
+    return c.html(homePage({ loggedIn: Boolean(sessionAccount(c)) }));
+  });
+
+  app.get("/install", (c) => {
+    return c.html(installPage(publicOrigin(c)));
+  });
+
+  app.get("/install.ps1", (c) => {
+    c.header("content-type", "text/plain; charset=utf-8");
+    return c.body(installPs1(publicOrigin(c)));
+  });
+
+  app.get("/install.sh", (c) => {
+    c.header("content-type", "text/plain; charset=utf-8");
+    return c.body(installSh(publicOrigin(c)));
+  });
+
+  app.get("/plugin/inkwell/latest", (c) => {
+    const version = pluginVersion();
+    if (!version) throw new HttpError(404, "Plugin files are not on the server");
+    c.header("content-type", "text/plain; charset=utf-8");
+    c.header("cache-control", "no-cache");
+    return c.body(`${version}\n`);
+  });
+
+  app.get("/plugin/inkwell/:version/:name", (c) => {
+    const version = c.req.param("version");
+    if (!/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(version) || version.includes("..") || version !== pluginVersion()) {
+      throw new HttpError(404, "Unknown version");
+    }
+    const name = c.req.param("name");
+    if (name === "SHA256SUMS") {
+      const sums = pluginChecksums();
+      if (!sums) throw new HttpError(404, "Plugin files are not on the server");
+      c.header("content-type", "text/plain; charset=utf-8");
+      c.header("cache-control", "no-cache");
+      return c.body(sums);
+    }
+    return pluginFile(c, name);
+  });
+
+  app.get("/plugin/inkwell/:name", (c) => pluginFile(c, c.req.param("name")));
+
+  app.get("/login", async (c) => {
+    if (config.mode === "single") return c.redirect("/account");
+    const handoff = handoffFrom(c.req.query("return"), c.req.query("state"), c.req.query("device"), c.req.query("vault"));
+    const accountId = sessionAccount(c);
+    if (accountId) {
+      if (handoff.startsWith("obsidian:")) return finishLogin(c, accountId, handoff);
+      return c.redirect("/account");
+    }
+    return c.html(loginPage({
+      ...loginView(c.req.query("return"), c.req.query("state"), c.req.query("device"), c.req.query("vault")),
+      oidc: Boolean(config.oidc),
+      devLogin: config.allowDevLogin,
+    }));
+  });
+
+  app.post("/auth/dev/login", async (c) => {
+    if (!config.allowDevLogin) throw new HttpError(404, "Developer login is disabled");
+    assertSameOrigin(c);
+    const form = await c.req.parseBody();
+    const username = String(form.username ?? "").trim();
+    const handoff = handoffFrom(String(form.return ?? ""), String(form.state ?? ""), String(form.device ?? ""), String(form.vault ?? ""));
+    if (!USERNAME.test(username)) {
+      return c.html(loginPage({
+        ...loginView(String(form.return ?? ""), String(form.state ?? ""), String(form.device ?? ""), String(form.vault ?? "")),
+        oidc: Boolean(config.oidc),
+        devLogin: true,
+        error: "Display name must be 2 to 64 characters and cannot contain line breaks",
+      }), 400);
+    }
+    const account = await db.upsertAccount(`dev:${username.toLowerCase()}`, username);
+    return finishLogin(c, account.id, handoff);
+  });
+
+  app.get("/auth/oidc/start", async (c) => {
+    if (!config.oidc) throw new HttpError(404, "SSO is not configured");
+    const handoff = handoffFrom(c.req.query("return"), c.req.query("state"), c.req.query("device"), c.req.query("vault"));
+    const request = await createOidcRequest(config.oidc);
+    await db.saveOauthState(request.state, request.nonce, request.codeVerifier, handoff, Date.now() + 10 * 60 * 1000);
+    return c.redirect(request.url);
+  });
+
+  app.get("/auth/oidc/callback", async (c) => {
+    if (!config.oidc) throw new HttpError(404, "SSO is not configured");
+    const oauthError = c.req.query("error");
+    if (oauthError) return c.html(messagePage("Login failed", oauthError), 400);
+    const code = c.req.query("code") ?? "";
+    const state = c.req.query("state") ?? "";
+    const saved = await db.takeOauthState(state);
+    if (!saved || !code) return c.html(messagePage("Login failed", "The login state expired. Start again."), 400);
+    let identity: Awaited<ReturnType<typeof completeOidcLogin>>;
+    try {
+      identity = await completeOidcLogin(config.oidc, code, saved.codeVerifier, saved.nonce);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "SSO login failed";
+      return c.html(messagePage("Login failed", message), 400);
+    }
+    const account = await db.upsertAccount(identity.subject, identity.displayName);
+    return finishLogin(c, account.id, saved.deviceCode);
+  });
+
+  app.post("/auth/logout", (c) => {
+    assertSameOrigin(c);
+    c.header("Set-Cookie", clearCookieHeader(isSecure(c)));
+    return c.redirect("/login");
+  });
+
+  app.post("/auth/password", async (c) => {
+    assertSameOrigin(c);
+    const form = await c.req.parseBody();
+    const loginId = String(form.loginId ?? "").trim();
+    const password = String(form.password ?? "");
+    const account = await passwordAccount(loginId, password);
+    if (!account) return c.html(loginPage({ oidc: Boolean(config.oidc), devLogin: config.allowDevLogin, device: String(form.device ?? ""), returnTo: String(form.return ?? ""), state: String(form.state ?? ""), vault: String(form.vault ?? ""), error: "登录 ID 或密码不对" }), 401);
+    const handoff = String(form.return ?? "") === "obsidian"
+      ? `obsidian:${String(form.state ?? "")}:${encodeURIComponent(String(form.vault ?? ""))}`
+      : String(form.device ?? "");
+    return finishLogin(c, account.id, handoff);
+  });
+
+  app.get("/admin", async (c) => {
+    if (!adminOpen(c)) return c.html(adminPage({ locked: true, badKey: c.req.query("error") === "key", accounts: [] }));
+    return c.html(adminPage({ accounts: await adminAccounts(), notice: c.req.query("notice") ?? "", created: createdLogin(c) }));
+  });
+
+  app.post("/admin/login", async (c) => {
+    assertSameOrigin(c);
+    const form = await c.req.parseBody();
+    if (!config.adminKey || !safeEqual(String(form.key ?? ""), config.adminKey)) return c.redirect("/admin?error=key");
+    c.header("Set-Cookie", adminCookie(isSecure(c)));
+    return c.redirect("/admin");
+  });
+
+  app.post("/admin/users", async (c) => {
+    assertSameOrigin(c);
+    if (!adminOpen(c)) return c.redirect("/admin");
+    const form = await c.req.parseBody();
+    const loginId = String(form.loginId ?? "").trim();
+    const accountId = String(form.accountId ?? "").trim();
+    if (!validLoginId(loginId)) return c.html(messagePage("登录 ID 无效", "用字母开头，3 到 32 位，只能包含字母、数字、下划线和短横线。"), 400);
+    if (await db.findLogin(loginId)) return c.html(messagePage("登录 ID 已存在", "换一个 ID。"), 409);
+    const password = randomPassword();
+    const hashed = await hashPassword(password);
+    const account = accountId
+      ? await db.findAccount(accountId)
+      : await db.upsertAccount(`login:${loginId}`, loginId);
+    if (!account) return c.html(messagePage("账户不存在", "检查账户 ID。"), 404);
+    if (await db.findLoginByAccount(account.id)) return c.html(messagePage("这个账户已经有登录 ID", "用重置密码。"), 409);
+    await db.insertLogin(loginId, account.id, hashed.hash, hashed.salt);
+    await db.setDisplayName(account.id, loginId);
+    c.header("Set-Cookie", createdCookie(loginId, password, isSecure(c)));
+    return c.redirect("/admin");
+  });
+
+  app.post("/admin/reset", async (c) => {
+    assertSameOrigin(c);
+    if (!adminOpen(c)) return c.redirect("/admin");
+    const form = await c.req.parseBody();
+    const accountId = String(form.accountId ?? "").trim();
+    const loginId = String(form.loginId ?? "").trim();
+    if (!validLoginId(loginId)) return c.html(messagePage("登录 ID 无效", "用字母开头，3 到 32 位。"), 400);
+    const account = await db.findAccount(accountId);
+    if (!account) return c.html(messagePage("账户不存在", "刷新后再试。"), 404);
+    const password = randomPassword();
+    const hashed = await hashPassword(password);
+    const existing = await db.findLoginByAccount(accountId);
+    const taken = await db.findLogin(loginId);
+    if (taken && taken.accountId !== accountId) return c.html(messagePage("登录 ID 已存在", "换一个 ID。"), 409);
+    if (existing && existing.loginId !== loginId) {
+      await db.deleteLogin(existing.loginId);
+    }
+    if (!taken) await db.insertLogin(loginId, accountId, hashed.hash, hashed.salt);
+    else await db.updateLoginPassword(loginId, hashed.hash, hashed.salt);
+    await db.setDisplayName(accountId, loginId);
+    c.header("Set-Cookie", createdCookie(loginId, password, isSecure(c)));
+    return c.redirect("/admin");
+  });
+
+  app.post("/access", async (c) => {
+    assertSameOrigin(c);
+    const form = await c.req.parseBody();
+    const token = String(form.token ?? "");
+    if (!config.accessToken || !safeEqual(token, config.accessToken)) {
+      return c.html(accessPage("Incorrect access token"), 401);
+    }
+    c.header("Set-Cookie", accessCookie(token, isSecure(c)));
+    return c.redirect("/account");
+  });
+
+  app.get("/account/enter", async (c) => {
+    const code = c.req.query("code") ?? "";
+    if (!DEVICE_CODE.test(code)) return c.redirect("/login");
+    const accountId = await db.takeLoginCode(code, "web");
+    if (!accountId) return c.html(messagePage("Login expired", "Open the site from Obsidian again."), 400);
+    c.header("Set-Cookie", setCookieHeader(sealSession(accountId, config.sessionSecret, config.sessionTtlMs), isSecure(c), config.sessionTtlMs));
+    const vault = c.req.query("vault") ?? "";
+    const target = vault ? `/account?vault=${encodeURIComponent(vault)}` : "/account";
+    return c.redirect(target);
+  });
+
+  app.get("/account", async (c) => {
+    if (config.mode === "single") {
+      if (!hasAccess(c)) return c.html(accessPage());
+      const account = await db.ensureSingleAccount();
+      return c.html(accountPage({
+        displayName: account.displayName,
+        accountId: account.id,
+        vaults: await db.listVaultStats(account.id),
+        recent: await db.listRecent(account.id, 20),
+        notice: c.req.query("notice"),
+        focusId: c.req.query("vault"),
+        mode: "single",
+      }));
+    }
+    const accountId = sessionAccount(c);
+    if (!accountId) return c.redirect("/login");
+    const account = await db.findAccount(accountId);
+    if (!account) return c.redirect("/login");
+    return c.html(accountPage({
+      displayName: account.displayName,
+      accountId: account.id,
+      vaults: await db.listVaultStats(account.id),
+      recent: await db.listRecent(account.id, 20),
+      notice: c.req.query("notice"),
+      focusId: c.req.query("vault"),
+      mode: "central",
+    }));
+  });
+
+  app.get("/pair", (c) => {
+    c.header("cache-control", "no-store");
+    const flash = takePairingFlash(c);
+    return c.html(pairPage({ origin: publicOrigin(c), ...flash }));
+  });
+
+  app.post("/pair", async (c) => {
+    assertSameOrigin(c);
+    const form = await c.req.parseBody();
+    let accountId: string;
+    try {
+      accountId = await pairingAccount(c, String(form.accountId ?? ""));
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 401) return c.redirect("/login");
+      throw error;
+    }
+    const issued = await issuePairingCode(accountId);
+    c.header("cache-control", "no-store");
+    c.header("Set-Cookie", pairingFlashCookie(issued, isSecure(c)));
+    return c.redirect("/pair");
+  });
+
+  const api = new Hono();
+
+  api.get("/health", (c) => c.json({
+    ok: true,
+    protocol: PROTOCOL_VERSION,
+    mode: config.mode,
+    storage: config.storage.kind,
+    ...(config.storage.kind === "r2" ? { inlineMaxBytes: config.storage.inlineMaxBytes } : {}),
+    database: config.database.kind,
+    requireEncryption: config.requireEncryption,
+    oidc: Boolean(config.oidc),
+    devLogin: config.allowDevLogin,
+  }));
+
+  api.get("/bootstrap", async (c) => {
+    if (!hasAccess(c)) throw new HttpError(401, "Access token required");
+    if (config.mode === "single") {
+      const account = await db.ensureSingleAccount();
+      const issue = c.req.query("issue") === "1";
+      return c.json({
+        mode: "single",
+        accountId: account.id,
+        displayName: account.displayName,
+        apiToken: issue ? await db.issueToken(account.id, config.sessionTtlMs) : undefined,
+        requireEncryption: config.requireEncryption,
+        registration: false,
+      });
+    }
+    return c.json({
+      mode: "central",
+      accountId: null,
+      requireEncryption: config.requireEncryption,
+      registration: true,
+    });
+  });
+
+  api.post("/device/start", async (c) => {
+    const now = Date.now();
+    deviceStarts = deviceStarts.filter((time) => now - time < 10 * 60 * 1000);
+    if (deviceStarts.length >= 100) throw new HttpError(429, "Too many login attempts. Try again later.");
+    deviceStarts.push(now);
+    const deviceCode = bytesToBase64Url(randomBytes(32));
+    const expiresAt = now + DEVICE_TTL_MS;
+    await db.createDeviceCode(deviceCode, expiresAt);
+    return c.json({ deviceCode, expiresAt });
+  });
+
+  api.get("/device/poll", async (c) => {
+    const code = c.req.query("code") ?? "";
+    if (!DEVICE_CODE.test(code)) throw new HttpError(404, "The login code is invalid or expired");
+    const accountId = await db.takeDeviceAccount(code);
+    if (accountId === undefined) throw new HttpError(404, "The login code is invalid or expired");
+    if (accountId === null) return c.json({ status: "pending" }, 202);
+    const apiToken = await db.issueToken(accountId, config.sessionTtlMs);
+    return c.json({ status: "ready", accountId, displayName: await accountName(accountId), apiToken });
+  });
+
+  api.post("/auth/exchange", async (c) => {
+    const body = parseJson(await readBody(c, 8 * 1024)) as { code?: unknown; state?: unknown };
+    const code = typeof body.code === "string" ? body.code : "";
+    const state = typeof body.state === "string" ? body.state : "";
+    if (!DEVICE_CODE.test(code) || !LOGIN_STATE.test(state)) throw new HttpError(400, "Invalid login callback");
+    const accountId = await db.takeLoginCode(code, state);
+    if (!accountId) throw new HttpError(400, "The login callback expired. Log in again from the plugin.");
+    return c.json({ accountId, displayName: await accountName(accountId), apiToken: await db.issueToken(accountId, config.sessionTtlMs) });
+  });
+
+  api.get("/account", async (c) => {
+    const { accountId } = await requireToken(c);
+    return c.json({ accountId, displayName: await accountName(accountId) });
+  });
+
+  api.post("/web-session", async (c) => {
+    const { accountId } = await requireToken(c);
+    const code = bytesToBase64Url(randomBytes(32));
+    await db.createLoginCode(code, accountId, "web", Date.now() + 2 * 60 * 1000);
+    return c.json({ code });
+  });
+
+  api.post("/logout", async (c) => {
+    const header = c.req.header("authorization") ?? "";
+    const match = /^Bearer\s+(\S+)$/i.exec(header);
+    if (match?.[1]) await db.revokeToken(match[1]);
+    return c.json({ ok: true });
+  });
+
+  api.get("/vaults", async (c) => {
+    const { accountId } = await requireToken(c);
+    const vaults = (await db.listVaultStats(accountId)).filter((vault) => vault.name);
+    return c.json({ vaults });
+  });
+
+  api.post("/vaults", async (c) => {
+    const { accountId } = await requireToken(c);
+    const body = parseJson(await readBody(c)) as { name?: unknown; encrypted?: unknown; create?: unknown };
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!VAULT_NAME.test(name)) throw new HttpError(400, "Invalid vault name");
+    const created = body.create === true
+      ? await db.createVault(accountId, name, body.encrypted === true)
+      : await db.rememberVault(accountId, name, body.encrypted === true);
+    if (created === "duplicate") throw new HttpError(409, "A vault with this name already exists");
+    const vault = (await db.listVaultStats(accountId)).find((item) => item.id === created);
+    return c.json(vault ?? { id: created, name, files: 0, bytes: 0, lastSyncAt: 0, encrypted: body.encrypted === true });
+  });
+
+  api.delete("/vaults/:vaultId", async (c) => {
+    const { accountId } = await requireToken(c);
+    const vaultId = c.req.param("vaultId").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(vaultId)) throw new HttpError(400, "Invalid vault id");
+    const removed = await db.deleteVault(accountId, vaultId);
+    if (!removed) throw new HttpError(404, "The remote vault does not exist");
+    for (const fileId of removed.fileIds) {
+      await blobs.delete(accountId, fileId);
+      await db.deleteObjectHash(accountId, fileId);
+    }
+    await forgetVersionBlobs(blobs, accountId, removed.versionIds);
+    return c.json({ ok: true, deleted: removed.fileIds.length });
+  });
+
+  api.get("/manifest", async (c) => {
+    const { accountId } = await requireToken(c);
+    const key = (c.req.query("vault") ?? "").trim();
+    const byId = await db.findVaultById(accountId, key);
+    const name = byId?.name ?? (VAULT_NAME.test(key) ? key : "");
+    if (!name) throw new HttpError(404, "The remote vault does not exist");
+    const files = (await db.listObjects(accountId, name)).map(toRemoteFile);
+    const cursor = await db.vaultCursor(accountId, name);
+    return c.json({ files, cursor });
+  });
+
+  // `since` omitted or empty reads the change log from the beginning. It is not a snapshot of files that predate the log.
+  api.get("/changes", async (c) => {
+    const { accountId } = await requireToken(c);
+    const name = await vaultNameFromQuery(accountId, c.req.query("vault"));
+    const since = parseSince(c.req.query("since"));
+    const limit = parseLimit(c.req.query("limit"));
+    const page = await db.listChanges(accountId, name, since, limit);
+    return c.json({ since, cursor: page.cursor, more: page.more, changes: page.changes });
+  });
+
+  api.post("/urls", async (c) => {
+    const { accountId } = await requireToken(c);
+    const body = parseJson(await readBody(c, 1024 * 1024)) as { vault?: unknown; downloads?: unknown; uploads?: unknown };
+    const vaultName = await vaultNameFromQuery(accountId, typeof body.vault === "string" ? body.vault : undefined);
+    const listed = await listTransferUrls({
+      config,
+      db,
+      accountId,
+      vaultName,
+      origin: publicOrigin(c),
+      downloads: stringList(body.downloads),
+      uploads: uploadList(body.uploads),
+    });
+    return c.json(listed);
+  });
+
+  api.post("/objects/:fileId/commit", async (c) => {
+    const fileId = c.req.param("fileId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    const { accountId } = await requireToken(c);
+    const commitBody = parseJson(await readBody(c));
+    const payload = parseCommitPayload(commitBody, config.requireEncryption);
+    const history = parseHistoryOptions(commitBody, payload.encoding, config.requireEncryption);
+    const named = payload.vaultId ? await db.findVaultById(accountId, payload.vaultId) : undefined;
+    if (payload.vaultId && !named) throw new HttpError(404, "The remote vault does not exist");
+    const vaultName = named?.name ?? payload.vault;
+    if (payload.encoding !== "e2ee" && await db.vaultEncrypted(accountId, vaultName)) {
+      throw new HttpError(409, "This vault is encrypted and no longer accepts plaintext");
+    }
+    const grant = await db.getUploadGrant(accountId, fileId);
+    if (!grant || grant.expiresAt <= Date.now()) throw new HttpError(400, "The upload URL has expired");
+    if (grant.bytes !== payload.blobBytes) throw new HttpError(400, "Uploaded object size does not match");
+    const room = await db.vaultRoom(accountId, vaultName, fileId, payload.size);
+    if (room) throw new HttpError(413, room);
+    const result = await db.putObjectRevision({
+      accountId,
+      fileId,
+      vaultName,
+      pathCipher: JSON.stringify(payload.pathCipher),
+      pathMac: payload.pathMac ?? "",
+      contentMac: payload.contentMac,
+      size: payload.size,
+      mtime: payload.mtime,
+      encoding: payload.encoding,
+    }, payload.parentRev ?? null, async () => {
+      await finishUpload(config, db, blobs, accountId, fileId, payload.encoding);
+    }, payload.renamed === true, recordHistory(db, blobs, history));
+    try {
+      await discardUpload(config, db, accountId, fileId);
+    } catch {
+      console.error("Failed to clear an upload slot");
+    }
+    if (result.status !== "conflict") await forgetVersionBlobs(blobs, accountId, result.history.droppedVersionIds);
+    if (result.status === "conflict") {
+      const deleted = result.reason === "deleted";
+      return c.json({
+        error: deleted
+          ? "The remote copy was deleted since this device last synced"
+          : "The remote copy changed since this device last synced",
+        reason: result.reason,
+        file: result.current ? toRemoteFile(result.current) : null,
+      }, 409);
+    }
+    await db.rememberVault(accountId, vaultName, payload.encoding === "e2ee");
+    return c.json({
+      ok: true,
+      rev: result.row.rev,
+      contentMac: result.row.contentMac,
+      mtime: result.row.mtime,
+      encoding: result.row.encoding,
+      size: result.row.size,
+      updatedAt: result.row.updatedAt,
+      ...historyResponse(result.history),
+    });
+  });
+
+  api.put("/direct/:accountId/:fileId", async (c) => {
+    const accountId = c.req.param("accountId");
+    const fileId = c.req.param("fileId");
+    if (!directAccount(accountId) || !FILE_ID.test(fileId) || !directRequestValid(
+      config.sessionSecret,
+      "PUT",
+      accountId,
+      fileId,
+      c.req.query("exp") ?? "",
+      c.req.query("sig") ?? "",
+    )) {
+      throw new HttpError(401, "The signed URL is invalid or expired");
+    }
+    await acceptServerUpload(config, db, accountId, fileId, Buffer.from(await readBody(c)));
+    return new Response(null, { status: 204 });
+  });
+
+  api.get("/direct/:accountId/:fileId", async (c) => {
+    const accountId = c.req.param("accountId");
+    const fileId = c.req.param("fileId");
+    if (!directAccount(accountId) || !FILE_ID.test(fileId) || !directRequestValid(
+      config.sessionSecret,
+      "GET",
+      accountId,
+      fileId,
+      c.req.query("exp") ?? "",
+      c.req.query("sig") ?? "",
+    )) {
+      throw new HttpError(401, "The signed URL is invalid or expired");
+    }
+    c.header("content-type", "application/json; charset=utf-8");
+    c.header("cache-control", "no-store");
+    return c.body(await serverDownload(blobs, accountId, fileId));
+  });
+
+  api.get("/direct-version/:accountId/:versionId", async (c) => {
+    const accountId = c.req.param("accountId");
+    const versionId = c.req.param("versionId");
+    if (!directAccount(accountId) || !FILE_ID.test(versionId) || !versionRequestValid(
+      config.sessionSecret,
+      "GET",
+      accountId,
+      versionId,
+      c.req.query("exp") ?? "",
+      c.req.query("sig") ?? "",
+    )) {
+      throw new HttpError(401, "The signed URL is invalid or expired");
+    }
+    c.header("content-type", "application/json; charset=utf-8");
+    c.header("cache-control", "no-store");
+    const version = await db.findFileVersion(accountId, versionId);
+    if (version?.kind === "delta") {
+      const patch = await db.getPatch(accountId, versionId);
+      if (!patch) throw new HttpError(404, "This version was folded into a checkpoint");
+      return c.body(patch);
+    }
+    return c.body(await serverVersionDownload(blobs, accountId, versionId));
+  });
+
+  api.put("/objects/:fileId", async (c) => {
+    const fileId = c.req.param("fileId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    const raw = await readBody(c);
+    const { accountId } = await requireToken(c);
+    const objectBody = parseJson(raw);
+    const payload = parseObjectPayload(objectBody, config.requireEncryption);
+    const history = parseHistoryOptions(objectBody, payload.encoding, config.requireEncryption);
+    const named = payload.vaultId ? await db.findVaultById(accountId, payload.vaultId) : undefined;
+    if (payload.vaultId && !named) throw new HttpError(404, "The remote vault does not exist");
+    const vaultName = named?.name ?? payload.vault;
+    if (payload.encoding !== "e2ee" && await db.vaultEncrypted(accountId, vaultName)) {
+      throw new HttpError(409, "This vault is encrypted and no longer accepts plaintext");
+    }
+    const room = await db.vaultRoom(accountId, vaultName, fileId, payload.size);
+    if (room) throw new HttpError(413, room);
+    const result = await db.putObjectRevision({
+      accountId,
+      fileId,
+      vaultName,
+      pathCipher: JSON.stringify(payload.pathCipher),
+      pathMac: payload.pathMac ?? "",
+      contentMac: payload.contentMac,
+      size: payload.size,
+      mtime: payload.mtime,
+      encoding: payload.encoding,
+    }, payload.parentRev ?? null, async () => {
+      await blobs.put(accountId, fileId, JSON.stringify(payload.contentCipher));
+    }, payload.renamed === true, recordHistory(db, blobs, history));
+    if (result.status !== "conflict") await forgetVersionBlobs(blobs, accountId, result.history.droppedVersionIds);
+    if (result.status === "conflict") {
+      const deleted = result.reason === "deleted";
+      return c.json({
+        error: deleted
+          ? "The remote copy was deleted since this device last synced"
+          : "The remote copy changed since this device last synced",
+        reason: result.reason,
+        file: result.current ? toRemoteFile(result.current) : null,
+      }, 409);
+    }
+    await db.rememberVault(accountId, vaultName, payload.encoding === "e2ee");
+    return c.json({
+      ok: true,
+      rev: result.row.rev,
+      contentMac: result.row.contentMac,
+      mtime: result.row.mtime,
+      encoding: result.row.encoding,
+      size: result.row.size,
+      updatedAt: result.row.updatedAt,
+      ...historyResponse(result.history),
+    });
+  });
+
+  api.get("/objects/:fileId", async (c) => {
+    const fileId = c.req.param("fileId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    const { accountId } = await requireToken(c);
+    const row = await db.findObject(accountId, fileId);
+    if (!row) throw new HttpError(404, "This file is not on the server");
+    const contentCipher = JSON.parse(await blobs.get(accountId, fileId)) as PayloadCipher;
+    return c.json({
+      vault: row.vaultName,
+      pathCipher: JSON.parse(row.pathCipher) as PayloadCipher,
+      contentCipher,
+      contentMac: row.contentMac,
+      size: row.size,
+      mtime: row.mtime,
+      encoding: row.encoding,
+      rev: row.rev,
+    });
+  });
+
+  api.post("/deletions", async (c) => {
+    const raw = await readBody(c, 1024 * 1024);
+    const { accountId } = await requireToken(c);
+    const body = parseJson(raw) as { ids?: unknown; localCount?: unknown; vault?: unknown; clearUnnamed?: unknown };
+    const vault = parseVaultName(typeof body.vault === "string" ? body.vault : undefined);
+    if (!Array.isArray(body.ids) || body.ids.length > 10000 || body.ids.some((id) => typeof id !== "string" || !FILE_ID.test(id))) {
+      throw new HttpError(400, "Invalid deletion list");
+    }
+    if (typeof body.localCount !== "number" || !Number.isInteger(body.localCount) || body.localCount < 0) {
+      throw new HttpError(400, "Invalid local file count");
+    }
+    if (body.localCount === 0 && body.clearUnnamed === true) {
+      throw new HttpError(409, "The local vault is empty, so the server backup was not cleared");
+    }
+    const removed = await db.deleteObjects(accountId, body.ids, vault);
+    if (body.clearUnnamed === true && body.localCount > 0) {
+      removed.push(...await db.deleteUnnamed(accountId));
+    }
+    return c.json({ deleted: removed.length });
+  });
+
+  api.post("/pairing/create", async (c) => {
+    const raw = await readBody(c, 8 * 1024);
+    const body = (raw.byteLength === 0 ? {} : parseJson(raw)) as { accountId?: unknown };
+    const requested = typeof body.accountId === "string" ? body.accountId : "";
+    const accountId = await pairingAccount(c, requested);
+    return c.json(await issuePairingCode(accountId));
+  });
+
+  api.post("/pairing/redeem", async (c) => {
+    if (tooMany(pairingRedeems)) throw new HttpError(429, "Too many login attempts. Try again later.");
+    let presented = "";
+    try {
+      const body = parseJson(await readBody(c, 8 * 1024)) as { code?: unknown };
+      presented = typeof body.code === "string" ? body.code : "";
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 400) {
+        throw new HttpError(400, "The pairing code is invalid or expired");
+      }
+      throw error;
+    }
+    const normalized = normalizePairingCode(presented);
+    const accountId = normalized ? await db.takePairingCode(normalized) : undefined;
+    const account = accountId ? await db.findAccount(accountId) : undefined;
+    if (!account) throw new HttpError(400, "The pairing code is invalid or expired");
+    return c.json({
+      accountId: account.id,
+      displayName: account.displayName,
+      apiToken: await db.issueToken(account.id, config.sessionTtlMs),
+    });
+  });
+
+  api.post("/login", async (c) => {
+    const body = parseJson(await readBody(c)) as { loginId?: unknown; password?: unknown };
+    const account = await passwordAccount(String(body.loginId ?? ""), String(body.password ?? ""));
+    if (!account) throw new HttpError(401, "The login ID or password is wrong");
+    return c.json({
+      accountId: account.id,
+      displayName: account.displayName,
+      apiToken: await db.issueToken(account.id, config.sessionTtlMs),
+    });
+  });
+
+  api.post("/password", async (c) => {
+    const { accountId } = await requireToken(c);
+    const body = parseJson(await readBody(c)) as { current?: unknown; next?: unknown };
+    const login = await db.findLoginByAccount(accountId);
+    const full = login ? await db.findLogin(login.loginId) : undefined;
+    if (!full || !(await verifyPassword(String(body.current ?? ""), full.passwordSalt, full.passwordHash))) {
+      throw new HttpError(401, "The current password is wrong");
+    }
+    const next = String(body.next ?? "");
+    if (next.length < 8 || next.length > 200) throw new HttpError(400, "Use a password of 8 to 200 characters");
+    const hashed = await hashPassword(next);
+    await db.updateLoginPassword(full.loginId, hashed.hash, hashed.salt);
+    return c.json({ ok: true });
+  });
+
+  api.post("/policy", async (c) => {
+    const { accountId } = await requireToken(c);
+    const body = parseJson(await readBody(c)) as Record<string, unknown>;
+    const trashDays = Number(body.trashDays);
+    const trashMaxFiles = Number(body.trashMaxFiles);
+    if (!Number.isInteger(trashDays) || trashDays < 1 || trashDays > 3650) throw new HttpError(400, "Invalid trash days");
+    if (!Number.isInteger(trashMaxFiles) || trashMaxFiles < 0 || trashMaxFiles > 100000) throw new HttpError(400, "Invalid trash file limit");
+    await db.setAccountPolicy(accountId, trashDays, trashMaxFiles);
+    if (typeof body.vaultId === "string" && body.vaultId) {
+      const maxFiles = Number(body.maxFiles ?? 0);
+      const maxBytes = Number(body.maxBytes ?? 0);
+      if (!Number.isInteger(maxFiles) || maxFiles < 0 || !Number.isInteger(maxBytes) || maxBytes < 0) {
+        throw new HttpError(400, "Invalid vault limit");
+      }
+      if (!await db.setVaultLimits(accountId, body.vaultId, maxFiles, maxBytes)) {
+        throw new HttpError(404, "The remote vault does not exist");
+      }
+    }
+    return c.json({ ok: true });
+  });
+
+  api.get("/trash", async (c) => {
+    const { accountId } = await requireToken(c);
+    const vault = await db.findVaultById(accountId, c.req.query("vault") ?? "");
+    if (!vault) throw new HttpError(404, "The remote vault does not exist");
+    const items = await db.listTrash(accountId, vault.name);
+    return c.json({
+      items: items.map((item) => ({
+        fileId: item.fileId,
+        pathCipher: JSON.parse(item.pathCipher) as PayloadCipher,
+        size: item.size,
+        deletedAt: item.deletedAt,
+        rev: item.rev,
+      })),
+    });
+  });
+
+  api.post("/trash/:fileId/restore", async (c) => {
+    const { accountId } = await requireToken(c);
+    const fileId = c.req.param("fileId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    const body = parseJson(await readBody(c)) as { vaultId?: unknown };
+    const vault = await db.findVaultById(accountId, typeof body.vaultId === "string" ? body.vaultId : "");
+    if (!vault) throw new HttpError(404, "The remote vault does not exist");
+    const restored = await db.restoreTrash(accountId, fileId, vault.name);
+    if (!restored) throw new HttpError(404, "This file is not in the trash");
+    return c.json({ ok: true, rev: restored.rev });
+  });
+
+  api.get("/files/:fileId/versions", async (c) => {
+    const fileId = c.req.param("fileId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    const { accountId } = await requireToken(c);
+    const vaultName = await vaultNameFromQuery(accountId, c.req.query("vault"));
+    const limit = parseLimit(c.req.query("limit"));
+    const versions = (await db.listFileVersions(accountId, fileId, vaultName, limit)).map(toVersionInfo);
+    return c.json({
+      fileId,
+      retention: await retentionFor(db, accountId, fileId),
+      versions,
+    });
+  });
+
+  api.get("/files/:fileId/retention", async (c) => {
+    const fileId = c.req.param("fileId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    const { accountId } = await requireToken(c);
+    return c.json(await retentionFor(db, accountId, fileId));
+  });
+
+  api.put("/files/:fileId/retention", async (c) => {
+    const fileId = c.req.param("fileId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    const { accountId } = await requireToken(c);
+    const patch = parseRetentionBody(parseJson(await readBody(c)));
+    const current = await retentionFor(db, accountId, fileId);
+    const saved = await db.saveRetention(
+      accountId,
+      fileId,
+      patch.autoLimit ?? current.autoLimit,
+      patch.manualLimit,
+    );
+    return c.json({
+      autoLimit: saved.autoLimit,
+      manualLimit: saved.manualLimit,
+      manualLimitEnforced: false as const,
+    });
+  });
+
+  api.post("/files/:fileId/version-urls", async (c) => {
+    const fileId = c.req.param("fileId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    const { accountId } = await requireToken(c);
+    const body = parseJson(await readBody(c)) as { vault?: unknown; versionIds?: unknown };
+    const vaultName = await vaultNameFromQuery(accountId, typeof body.vault === "string" ? body.vault : undefined);
+    if (!Array.isArray(body.versionIds) || body.versionIds.some((id) => typeof id !== "string")) {
+      throw new HttpError(400, "Invalid version list");
+    }
+    const downloads = await listVersionDownloads({
+      config,
+      db,
+      accountId,
+      fileId,
+      vaultName,
+      versionIds: body.versionIds,
+      origin: publicOrigin(c),
+    });
+    return c.json({ downloads });
+  });
+
+  api.post("/files/:fileId/versions/:versionId/restore", async (c) => {
+    const fileId = c.req.param("fileId");
+    const versionId = c.req.param("versionId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    assertVersionId(versionId);
+    const { accountId } = await requireToken(c);
+    const body = parseJson(await readBody(c, 16 * 1024));
+    const requested = body as { vault?: unknown; vaultId?: unknown };
+    const vaultKey = typeof requested.vaultId === "string" && requested.vaultId
+      ? requested.vaultId
+      : typeof requested.vault === "string" ? requested.vault : undefined;
+    const vaultName = await vaultNameFromQuery(accountId, vaultKey);
+    const version = await db.findFileVersion(accountId, versionId);
+    if (!version || version.fileId !== fileId || version.vaultName !== vaultName) {
+      throw new HttpError(404, "This version is not on the server");
+    }
+    if (version.kind === "delta") {
+      throw new HttpError(409, "This change is stored as a patch. Restore it from a device that can decrypt the vault");
+    }
+    const parentRev = parseParentRev(body);
+    const result = await db.putObjectRevision({
+      accountId,
+      fileId,
+      vaultName,
+      pathCipher: version.pathCipher,
+      pathMac: "",
+      contentMac: version.contentMac,
+      size: version.size,
+      mtime: version.mtime,
+      encoding: version.encoding,
+    }, parentRev, async () => {
+      await blobs.put(accountId, fileId, await blobs.getVersion(accountId, versionId));
+    }, false, recordHistory(db, blobs, { syncTrigger: "restore", kind: "checkpoint" }));
+    if (result.status !== "conflict") await forgetVersionBlobs(blobs, accountId, result.history.droppedVersionIds);
+    if (result.status === "conflict") {
+      const deleted = result.reason === "deleted";
+      return c.json({
+        error: deleted
+          ? "The remote copy was deleted since this device last synced"
+          : "The remote copy changed since this device last synced",
+        reason: result.reason,
+        file: result.current ? toRemoteFile(result.current) : null,
+      }, 409);
+    }
+    return c.json({
+      ok: true,
+      rev: result.row.rev,
+      contentMac: result.row.contentMac,
+      mtime: result.row.mtime,
+      encoding: result.row.encoding,
+      size: result.row.size,
+      updatedAt: result.row.updatedAt,
+      ...historyResponse(result.history),
+    });
+  });
+
+  api.post("/files/:fileId/checkpoints", async (c) => {
+    const fileId = c.req.param("fileId");
+    if (!FILE_ID.test(fileId)) throw new HttpError(400, "Invalid file ID");
+    const { accountId } = await requireToken(c);
+    const body = parseJson(await readBody(c));
+    const upload = parseCheckpointUpload(body, config.requireEncryption);
+    const requested = body as { vault?: unknown; vaultId?: unknown };
+    const vaultKey = typeof requested.vaultId === "string" && requested.vaultId
+      ? requested.vaultId
+      : typeof requested.vault === "string" ? requested.vault : undefined;
+    const vaultName = await vaultNameFromQuery(accountId, vaultKey);
+    const tip = await db.findObject(accountId, fileId);
+    if (!tip || tip.vaultName !== vaultName) throw new HttpError(404, "This file is not on the server");
+    if (tip.rev !== upload.tipRev || tip.contentMac !== upload.contentMac || tip.encoding !== upload.encoding || tip.size !== upload.size) {
+      return c.json({
+        error: "The remote copy changed since this device last synced",
+        reason: "parent_rev",
+        file: toRemoteFile(tip),
+      }, 409);
+    }
+    const retained = await retentionFor(db, accountId, fileId);
+    let history;
+    try {
+      history = await storeUploadedCheckpoint(
+        db,
+        blobs,
+        tip,
+        upload.syncTrigger,
+        JSON.stringify(upload.contentCipher),
+        retained.autoLimit,
+      );
+    } catch (error) {
+      if (error instanceof TipMovedError) {
+        return c.json({
+          error: "The remote copy changed since this device last synced",
+          reason: "parent_rev",
+          file: error.current ? toRemoteFile(error.current) : null,
+        }, 409);
+      }
+      throw error;
+    }
+    await forgetVersionBlobs(blobs, accountId, history.droppedVersionIds);
+    return c.json({
+      ok: true,
+      versionId: history.versionId,
+      historyKind: history.historyKind,
+      flush: history.flush,
+      rev: tip.rev,
+      contentMac: tip.contentMac,
+    });
+  });
+
+  api.get("/vaults/:vaultId/history-flush", async (c) => {
+    const { accountId } = await requireToken(c);
+    const vaultId = c.req.param("vaultId").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(vaultId)) throw new HttpError(400, "Invalid vault id");
+    const vault = await db.findVaultById(accountId, vaultId);
+    if (!vault) throw new HttpError(404, "The remote vault does not exist");
+    const trigger = parseFlushTrigger(c.req.query("syncTrigger") ?? c.req.query("sync_trigger"));
+    const grouped = new Map<string, { size: number; patchBytes: number; createdAt: number }[]>();
+    for (const row of await db.listUnsealedDeltas(accountId, vault.name)) {
+      const list = grouped.get(row.fileId);
+      const stat = { size: row.size, patchBytes: row.patchBytes, createdAt: row.createdAt };
+      if (list) list.push(stat);
+      else grouped.set(row.fileId, [stat]);
+    }
+    const files: {
+      fileId: string;
+      pendingCount: number;
+      pendingBytes: number;
+      earliest: number | null;
+      reason: string;
+    }[] = [];
+    const now = Date.now();
+    const limit = trigger === "manual" ? 20000 : 100;
+    for (const [fileId, pending] of grouped) {
+      const flush = flushReasonForSync(pending, now, trigger);
+      if (!flush.due || !flush.reason) continue;
+      files.push({
+        fileId,
+        pendingCount: flush.pendingCount,
+        pendingBytes: flush.pendingBytes,
+        earliest: flush.earliest,
+        reason: flush.reason,
+      });
+      if (files.length >= limit) break;
+    }
+    return c.json({ files });
+  });
+
+  api.post("/vaults/:vaultId/plaintext-history", async (c) => {
+    const { accountId } = await requireToken(c);
+    const vaultId = c.req.param("vaultId").trim();
+    if (!/^[0-9a-f-]{36}$/i.test(vaultId)) throw new HttpError(400, "Invalid vault id");
+    const vault = await db.findVaultById(accountId, vaultId);
+    if (!vault) throw new HttpError(404, "The remote vault does not exist");
+    if (!vault.encrypted) throw new HttpError(409, "Plaintext history is only removed after the vault is encrypted");
+    const versionIds = await db.deletePlaintextVersions(accountId, vault.name);
+    await forgetVersionBlobs(blobs, accountId, versionIds);
+    return c.json({ deleted: versionIds.length });
+  });
+
+  app.route("/api/v1", api);
+  mount?.routes?.(app, deps);
+
+  app.notFound((c) => {
+    if (c.req.path.startsWith("/api/")) return c.json({ error: "Unknown API" }, 404);
+    return c.html(messagePage("Page not found", "This address does not exist"), 404);
+  });
+
+  app.onError((err, c) => {
+    if (err instanceof HttpError) {
+      if (c.req.path.startsWith("/api/") || (c.req.header("accept") ?? "").includes("application/json")) {
+        return jsonMessage(err.status, err.message);
+      }
+      return c.html(messagePage("Something went wrong", err.message), errorStatus(err.status));
+    }
+    console.error(err);
+    return jsonMessage(500, "Internal server error");
+  });
+
+  return app;
+
+  function sessionAccount(c: Context): string | undefined {
+    const token = readCookie(c.req.header("cookie"), sessionCookieName());
+    if (!token) return undefined;
+    return openSession(token, config.sessionSecret);
+  }
+
+  function hasAccess(c: Context): boolean {
+    if (!config.accessToken) return true;
+    const header = c.req.header("x-access-token") ?? "";
+    const cookie = readCookie(c.req.header("cookie"), "sync_access") ?? "";
+    return safeEqual(header, config.accessToken) || safeEqual(cookie, config.accessToken);
+  }
+
+  async function passwordAccount(loginId: string, password: string) {
+    if (!validLoginId(loginId) || password.length < 1) return undefined;
+    const login = await db.findLogin(loginId);
+    if (!login || !(await verifyPassword(password, login.passwordSalt, login.passwordHash))) return undefined;
+    return db.findAccount(login.accountId);
+  }
+
+  function adminOpen(c: Context): boolean {
+    if (!config.adminKey) return false;
+    const raw = readCookie(c.req.header("cookie"), "sync_admin");
+    return Boolean(raw && openSession(raw, config.adminKey) === "admin");
+  }
+
+  function adminCookie(secure: boolean): string {
+    const token = sealSession("admin", config.adminKey, 12 * 60 * 60 * 1000);
+    const parts = [`sync_admin=${encodeURIComponent(token)}`, "HttpOnly", "SameSite=Lax", "Path=/", "Max-Age=43200"];
+    if (secure) parts.push("Secure");
+    return parts.join("; ");
+  }
+
+  function createdCookie(loginId: string, password: string, secure: boolean): string {
+    const value = Buffer.from(JSON.stringify({ loginId, password })).toString("base64url");
+    const parts = [`sync_created=${value}`, "HttpOnly", "SameSite=Lax", "Path=/", "Max-Age=120"];
+    if (secure) parts.push("Secure");
+    return parts.join("; ");
+  }
+
+  function createdLogin(c: Context): { loginId: string; password: string } | undefined {
+    const raw = readCookie(c.req.header("cookie"), "sync_created");
+    if (!raw) return undefined;
+    c.header("Set-Cookie", "sync_created=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+    try {
+      const parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as { loginId?: unknown; password?: unknown };
+      if (typeof parsed.loginId !== "string" || typeof parsed.password !== "string") return undefined;
+      return { loginId: parsed.loginId, password: parsed.password };
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function adminAccounts(): Promise<{ id: string; displayName: string; loginId: string }[]> {
+    const accounts = await db.listAccounts();
+    const logins = await db.listLogins();
+    return accounts.map((account) => ({
+      id: account.id,
+      displayName: account.displayName,
+      loginId: logins.find((item) => item.accountId === account.id)?.loginId ?? "",
+    }));
+  }
+
+  async function finishLogin(c: Context, accountId: string, handoff: string): Promise<Response> {
+    c.header("Set-Cookie", setCookieHeader(sealSession(accountId, config.sessionSecret, config.sessionTtlMs), isSecure(c), config.sessionTtlMs));
+    const back = unpackObsidian(handoff);
+    if (back) {
+      const code = bytesToBase64Url(randomBytes(32));
+      await db.createLoginCode(code, accountId, back.state, Date.now() + 2 * 60 * 1000);
+      return c.html(obsidianReturnPage(code, back.state, back.vault));
+    }
+    let notice = "";
+    if (handoff && DEVICE_CODE.test(handoff)) {
+      notice = await db.claimDeviceCode(handoff, accountId) ? "device-ok" : "device-missing";
+    }
+    return c.redirect(notice ? `/account?notice=${notice}` : "/account");
+  }
+
+  async function accountName(accountId: string): Promise<string> {
+    return (await db.findAccount(accountId))?.displayName ?? "";
+  }
+
+  async function pairingAccount(c: Context, requestedId?: string): Promise<string> {
+    const requested = (requestedId ?? "").trim();
+    const admin = adminOpen(c);
+    if (admin && requested) {
+      const account = await db.findAccount(requested);
+      if (!account) throw new HttpError(404, "The account does not exist");
+      return account.id;
+    }
+    const bearer = await accountFromBearer(c);
+    if (bearer) return bearer;
+    const session = sessionAccount(c);
+    if (session && await db.findAccount(session)) return session;
+    if (config.mode === "single" && (hasAccess(c) || admin)) {
+      return (await db.ensureSingleAccount()).id;
+    }
+    if (admin) throw new HttpError(400, "Choose an account for the pairing code");
+    throw new HttpError(401, "Log in before creating a pairing code");
+  }
+
+  async function accountFromBearer(c: Context): Promise<string | undefined> {
+    const header = c.req.header("authorization") ?? "";
+    if (!header) return undefined;
+    const match = /^Bearer\s+(\S+)$/i.exec(header);
+    if (!match?.[1]) throw new HttpError(401, "Log in before creating a pairing code");
+    const accountId = await db.findAccountByToken(match[1]);
+    if (!accountId) throw new HttpError(401, "The login expired. Log in again.");
+    return accountId;
+  }
+
+  async function issuePairingCode(accountId: string): Promise<{ code: string; expiresAt: number; accountId: string }> {
+    const expiresAt = Date.now() + PAIRING_TTL_MS;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const raw = randomPairingCode();
+      try {
+        await db.replacePairingCode(accountId, raw, expiresAt);
+        return { code: formatPairingCode(raw), expiresAt, accountId };
+      } catch {
+        if (attempt === 4) throw new HttpError(500, "Could not create a pairing code");
+      }
+    }
+    throw new HttpError(500, "Could not create a pairing code");
+  }
+
+  function takePairingFlash(c: Context): { code: string; expiresAt: number; accountId: string } | undefined {
+    const raw = readCookie(c.req.header("cookie"), "sync_pairing");
+    if (!raw) return undefined;
+    c.header("Set-Cookie", "sync_pairing=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+    try {
+      const parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as {
+        code?: unknown;
+        expiresAt?: unknown;
+        accountId?: unknown;
+      };
+      if (typeof parsed.code !== "string" || typeof parsed.expiresAt !== "number" || typeof parsed.accountId !== "string") return undefined;
+      if (!/^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$/.test(parsed.code)) return undefined;
+      return { code: parsed.code, expiresAt: parsed.expiresAt, accountId: parsed.accountId };
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function requireToken(c: Context): Promise<{ accountId: string }> {
+    const header = c.req.header("authorization") ?? "";
+    const match = /^Bearer\s+(\S+)$/i.exec(header);
+    if (!match) throw new HttpError(401, "Log in from the plugin first");
+    const accountId = await db.findAccountByToken(match[1] ?? "");
+    if (!accountId) throw new HttpError(401, "The login expired. Log in again.");
+    return { accountId };
+  }
+
+  async function vaultNameFromQuery(accountId: string, vault: string | undefined): Promise<string> {
+    const key = (vault ?? "").trim();
+    const byId = await db.findVaultById(accountId, key);
+    const name = byId?.name ?? (VAULT_NAME.test(key) ? key : "");
+    if (!name) throw new HttpError(404, "The remote vault does not exist");
+    return name;
+  }
+}
+
+function safeDevice(value: string | undefined): string {
+  return value && DEVICE_CODE.test(value) ? value : "";
+}
+
+function handoffFrom(returnTo: string | undefined, state: string | undefined, device: string | undefined, vault: string | undefined): string {
+  if (returnTo === "obsidian" && state && LOGIN_STATE.test(state)) {
+    const name = (vault ?? "").trim();
+    const safeVault = name && VAULT_NAME.test(name) ? encodeURIComponent(name) : "";
+    const packed = safeVault ? `obsidian:${state}:${safeVault}` : `obsidian:${state}`;
+    return packed.length <= 128 ? packed : `obsidian:${state}`;
+  }
+  return safeDevice(device);
+}
+
+function unpackObsidian(handoff: string): { state: string; vault: string } | undefined {
+  if (!handoff.startsWith("obsidian:")) return undefined;
+  const rest = handoff.slice("obsidian:".length);
+  const split = rest.indexOf(":");
+  const state = split === -1 ? rest : rest.slice(0, split);
+  const vault = split === -1 ? "" : decodeURIComponent(rest.slice(split + 1));
+  if (!LOGIN_STATE.test(state)) return undefined;
+  if (vault && !VAULT_NAME.test(vault)) return { state, vault: "" };
+  return { state, vault };
+}
+
+function loginView(returnTo: string | undefined, state: string | undefined, device: string | undefined, vault: string | undefined): {
+  device: string;
+  returnTo?: string;
+  state?: string;
+  vault?: string;
+} {
+  const back = returnTo === "obsidian" && Boolean(state && LOGIN_STATE.test(state));
+  const name = (vault ?? "").trim();
+  return {
+    device: safeDevice(device),
+    returnTo: back ? "obsidian" : undefined,
+    state: back ? state : undefined,
+    vault: back && name && VAULT_NAME.test(name) ? name : undefined,
+  };
+}
+
+function publicOrigin(c: Context): string {
+  const host = c.req.header("x-forwarded-host") ?? c.req.header("host");
+  if (!host) return new URL(c.req.url).origin;
+  const proto = c.req.header("x-forwarded-proto") ?? (c.req.url.startsWith("https://") ? "https" : "http");
+  return `${proto}://${host}`;
+}
+
+function iconResponse(_c: Context): Response {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const dirs = [join(process.cwd(), "public"), join(here, "..", "public")];
+  for (const dir of dirs) {
+    const path = join(dir, "favicon.png");
+    if (!existsSync(path)) continue;
+    const bytes = new Uint8Array(readFileSync(path));
+    return new Response(bytes, {
+      headers: {
+        "content-type": "image/png",
+        "cache-control": "no-cache",
+      },
+    });
+  }
+  throw new HttpError(404, "Icon not found");
+}
+
+const PLUGIN_FILES: Record<string, string> = {
+  "manifest.json": "application/json; charset=utf-8",
+  "main.js": "text/javascript; charset=utf-8",
+  "styles.css": "text/css; charset=utf-8",
+};
+
+function pluginFile(c: Context, name: string): Response {
+  const type = PLUGIN_FILES[name];
+  if (!type) throw new HttpError(404, "Unknown file");
+  const file = readPluginFile(name);
+  if (!file) throw new HttpError(404, "Plugin files are not on the server");
+  c.header("content-type", type);
+  c.header("cache-control", "no-cache");
+  return c.body(file);
+}
+
+function pluginVersion(): string {
+  const raw = readPluginFile("manifest.json");
+  if (!raw) return "";
+  try {
+    const version = (JSON.parse(raw) as { version?: unknown }).version;
+    return typeof version === "string" ? version : "";
+  } catch {
+    return "";
+  }
+}
+
+function pluginChecksums(): string | undefined {
+  const lines: string[] = [];
+  for (const name of Object.keys(PLUGIN_FILES)) {
+    const file = readPluginFile(name);
+    if (!file) return undefined;
+    const hash = createHash("sha256").update(file).digest("hex");
+    lines.push(`${hash}  ${name}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function readPluginFile(name: string): string | undefined {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const dirs = [process.env.PLUGIN_DIR, join(process.cwd(), "plugin"), join(process.cwd(), "..", "client"), join(here, "..", "..", "client")];
+  for (const dir of dirs) {
+    if (!dir) continue;
+    const path = join(dir, name);
+    if (!existsSync(path)) continue;
+    return readFileSync(path, "utf8");
+  }
+  return undefined;
+}
+
+function isSecure(c: Context): boolean {
+  return c.req.url.startsWith("https://") || c.req.header("x-forwarded-proto") === "https";
+}
+
+function assertSameOrigin(c: Context): void {
+  const host = c.req.header("host");
+  if (!host) return;
+  const origin = c.req.header("origin");
+  if (origin && origin !== "null") {
+    if (hostOf(origin) !== host) throw new HttpError(403, "Login origin does not match");
+    return;
+  }
+  const referer = c.req.header("referer");
+  if (referer && hostOf(referer) !== host) throw new HttpError(403, "Login origin does not match");
+}
+
+function hostOf(value: string): string | undefined {
+  try {
+    return new URL(value).host;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readBody(c: Context, max = MAX_BODY_BYTES): Promise<Uint8Array> {
+  const length = Number(c.req.header("content-length") ?? "0");
+  if (Number.isFinite(length) && length > max) throw new HttpError(413, "Request body is too large");
+  const body = new Uint8Array(await c.req.arrayBuffer());
+  if (body.byteLength > max) throw new HttpError(413, "Request body is too large");
+  return body;
+}
+
+function parseJson(body: Uint8Array): unknown {
+  try {
+    return JSON.parse(new TextDecoder().decode(body));
+  } catch {
+    throw new HttpError(400, "Invalid JSON");
+  }
+}
+
+function toRemoteFile(row: ObjectRow): RemoteFile {
+  return {
+    fileId: row.fileId,
+    contentMac: row.contentMac,
+    size: row.size,
+    mtime: row.mtime,
+    updatedAt: row.updatedAt,
+    encoding: row.encoding,
+    rev: row.rev,
+  };
+}
+
+function parseSince(value: string | undefined): number {
+  if (value === undefined || value === "") return 0;
+  if (!/^\d+$/.test(value)) throw new HttpError(400, "Invalid changes cursor");
+  const since = Number(value);
+  if (!Number.isSafeInteger(since)) throw new HttpError(400, "Invalid changes cursor");
+  return since;
+}
+
+function parseLimit(value: string | undefined): number {
+  if (value === undefined || value === "") return 2000;
+  if (!/^\d+$/.test(value)) throw new HttpError(400, "Invalid changes limit");
+  const limit = Number(value);
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new HttpError(400, "Invalid changes limit");
+  return Math.min(5000, limit);
+}
+
+function parseFlushTrigger(value: string | undefined): "auto" | "manual" {
+  if (value === undefined || value === "" || value === "auto") return "auto";
+  if (value === "manual") return "manual";
+  throw new HttpError(400, "Invalid sync trigger");
+}
+
+function parseVaultName(value: string | undefined): string {
+  const name = (value ?? "").trim();
+  if (!VAULT_NAME.test(name)) throw new HttpError(400, "Invalid vault name");
+  return name;
+}
+
+function parseCipher(value: unknown, requireEncryption: boolean): PayloadCipher {
+  if (!value || typeof value !== "object") throw new HttpError(400, "Invalid ciphertext");
+  const record = value as { v?: unknown; iv?: unknown; ct?: unknown; raw?: unknown };
+  if (record.v === 0) {
+    if (requireEncryption) throw new HttpError(400, "The server requires encryption and rejected plaintext");
+    if (typeof record.raw !== "string" || record.raw.length > MAX_BODY_BYTES) {
+      throw new HttpError(400, "Invalid plaintext");
+    }
+    return { v: 0, raw: record.raw };
+  }
+  if (record.v !== 1 || typeof record.iv !== "string" || typeof record.ct !== "string") {
+    throw new HttpError(400, "Invalid ciphertext");
+  }
+  if (record.iv.length > 64 || record.ct.length > MAX_BODY_BYTES) throw new HttpError(413, "Ciphertext is too large");
+  return { v: 1, iv: record.iv, ct: record.ct };
+}
+
+function stringList(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw new HttpError(400, "Invalid URL list");
+  return value;
+}
+
+function uploadList(value: unknown): { fileId: string; parentRev: number | null; bytes: number; sha256: string }[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new HttpError(400, "Invalid URL list");
+  return value.map((item) => {
+    if (!item || typeof item !== "object") throw new HttpError(400, "Invalid URL list");
+    const record = item as { fileId?: unknown; bytes?: unknown; sha256?: unknown };
+    if (typeof record.fileId !== "string" || typeof record.bytes !== "number") throw new HttpError(400, "Invalid URL list");
+    return { fileId: record.fileId, parentRev: parseParentRev(item), bytes: record.bytes, sha256: typeof record.sha256 === "string" ? record.sha256 : "" };
+  });
+}
+
+function directAccount(accountId: string): boolean {
+  return /^[0-9a-f-]{36}$/i.test(accountId);
+}
+
+function parseCommitPayload(value: unknown, requireEncryption: boolean): Omit<ObjectPayload, "contentCipher"> & { blobBytes: number } {
+  if (!value || typeof value !== "object") throw new HttpError(400, "Invalid request");
+  const body = value as Partial<ObjectPayload> & { blobBytes?: unknown };
+  if (typeof body.contentMac !== "string" || !/^[0-9a-f]{64}$/.test(body.contentMac)) {
+    throw new HttpError(400, "Invalid content fingerprint");
+  }
+  if (body.encoding !== "e2ee" && body.encoding !== "plain") throw new HttpError(400, "Invalid encryption flag");
+  if (requireEncryption && body.encoding !== "e2ee") throw new HttpError(400, "The server requires encryption and rejected plaintext");
+  if (typeof body.size !== "number" || !Number.isInteger(body.size) || body.size < 0 || body.size > MAX_FILE_BYTES) {
+    throw new HttpError(400, "Invalid file size");
+  }
+  if (typeof body.mtime !== "number" || !Number.isFinite(body.mtime)) throw new HttpError(400, "Invalid modification time");
+  if (typeof body.blobBytes !== "number" || !Number.isSafeInteger(body.blobBytes) || body.blobBytes < 0 || body.blobBytes > MAX_BODY_BYTES) {
+    throw new HttpError(400, "Invalid upload size");
+  }
+  const pathCipher = parseCipher(body.pathCipher, requireEncryption);
+  const encoding: Encoding = body.encoding;
+  if (cipherEncoding(pathCipher) !== encoding) throw new HttpError(400, "Ciphertext format does not match the encryption flag");
+  return {
+    vault: parseVaultName(typeof body.vault === "string" ? body.vault : undefined),
+    vaultId: typeof body.vaultId === "string" ? body.vaultId : "",
+    pathCipher,
+    contentMac: body.contentMac,
+    size: body.size,
+    mtime: body.mtime,
+    encoding,
+    parentRev: parseParentRev(value),
+    blobBytes: body.blobBytes,
+    pathMac: typeof body.pathMac === "string" && /^[0-9a-f]{64}$/.test(body.pathMac) ? body.pathMac : "",
+    renamed: body.renamed === true,
+  };
+}
+
+function parseObjectPayload(value: unknown, requireEncryption: boolean): ObjectPayload {
+  if (!value || typeof value !== "object") throw new HttpError(400, "Invalid request");
+  const body = value as Partial<ObjectPayload>;
+  if (typeof body.contentMac !== "string" || !/^[0-9a-f]{64}$/.test(body.contentMac)) {
+    throw new HttpError(400, "Invalid content fingerprint");
+  }
+  if (body.encoding !== "e2ee" && body.encoding !== "plain") throw new HttpError(400, "Invalid encryption flag");
+  if (requireEncryption && body.encoding !== "e2ee") throw new HttpError(400, "The server requires encryption and rejected plaintext");
+  if (typeof body.size !== "number" || !Number.isInteger(body.size) || body.size < 0 || body.size > MAX_FILE_BYTES) {
+    throw new HttpError(400, "Invalid file size");
+  }
+  if (typeof body.mtime !== "number" || !Number.isFinite(body.mtime)) throw new HttpError(400, "Invalid modification time");
+  const pathCipher = parseCipher(body.pathCipher, requireEncryption);
+  const contentCipher = parseCipher(body.contentCipher, requireEncryption);
+  const encoding: Encoding = body.encoding;
+  if (cipherEncoding(pathCipher) !== encoding || cipherEncoding(contentCipher) !== encoding) {
+    throw new HttpError(400, "Ciphertext format does not match the encryption flag");
+  }
+  return {
+    vault: parseVaultName(typeof body.vault === "string" ? body.vault : undefined),
+    vaultId: typeof body.vaultId === "string" ? body.vaultId : "",
+    pathCipher,
+    contentCipher,
+    contentMac: body.contentMac,
+    size: body.size,
+    mtime: body.mtime,
+    encoding,
+    parentRev: parseParentRev(value),
+    pathMac: typeof body.pathMac === "string" && /^[0-9a-f]{64}$/.test(body.pathMac) ? body.pathMac : "",
+    renamed: body.renamed === true,
+  };
+}
+
+// Missing parentRev on an existing object is a conflict when the content fingerprint differs.
+// The same fingerprint is an idempotent success and does not bump rev. Old clients can create
+// files and retry identical uploads; they cannot silently overwrite a divergent copy.
+function parseParentRev(value: unknown): number | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as { parentRev?: unknown; parent_rev?: unknown };
+  const camel = record.parentRev;
+  const snake = record.parent_rev;
+  if (camel !== undefined && snake !== undefined && !sameParent(camel, snake)) {
+    throw new HttpError(400, "parentRev and parent_rev do not match");
+  }
+  const raw = camel !== undefined ? camel : snake;
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw < 0) {
+    throw new HttpError(400, "Invalid parent revision");
+  }
+  return raw;
+}
+
+function sameParent(left: unknown, right: unknown): boolean {
+  if (left === null && right === null) return true;
+  return left === right;
+}
+
+function cipherEncoding(value: PayloadCipher): Encoding {
+  return value.v === 0 ? "plain" : "e2ee";
+}
+
+function safeEqual(left: string, right: string): boolean {
+  const a = Buffer.from(left);
+  const b = Buffer.from(right);
+  if (a.length !== b.length || a.length === 0) return false;
+  return timingSafeEqual(a, b);
+}
+
+function accessCookie(token: string, secure: boolean): string {
+  const parts = [
+    `sync_access=${encodeURIComponent(token)}`,
+    "HttpOnly",
+    "SameSite=Lax",
+    "Path=/",
+    "Max-Age=2592000",
+  ];
+  if (secure) parts.push("Secure");
+  return parts.join("; ");
+}
+
+function tooMany(bucket: number[], limit = 100, windowMs = 10 * 60 * 1000): boolean {
+  const now = Date.now();
+  const fresh = bucket.filter((time) => now - time < windowMs);
+  bucket.length = 0;
+  bucket.push(...fresh);
+  if (fresh.length >= limit) return true;
+  bucket.push(now);
+  return false;
+}
+
+function normalizePairingCode(input: string): string | undefined {
+  if (input.length > 32) return undefined;
+  const compact = input.replace(/[\s-]/g, "").toUpperCase();
+  return PAIRING_CODE.test(compact) ? compact : undefined;
+}
+
+function formatPairingCode(raw: string): string {
+  return `${raw.slice(0, 4)}-${raw.slice(4, 8)}`;
+}
+
+function randomPairingCode(): string {
+  let raw = "";
+  for (const byte of randomBytes(8)) raw += PAIRING_ALPHABET[byte % PAIRING_ALPHABET.length];
+  return raw;
+}
+
+function pairingFlashCookie(payload: { code: string; expiresAt: number; accountId: string }, secure: boolean): string {
+  const value = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const parts = [`sync_pairing=${encodeURIComponent(value)}`, "HttpOnly", "SameSite=Lax", "Path=/", "Max-Age=120"];
+  if (secure) parts.push("Secure");
+  return parts.join("; ");
+}
+
+function jsonMessage(status: number, message: string): Response {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+function errorStatus(status: number): 400 | 401 | 403 | 404 | 409 | 413 | 429 | 500 {
+  if (status === 400 || status === 401 || status === 403 || status === 404 || status === 409 || status === 413 || status === 429) {
+    return status;
+  }
+  return 500;
+}
